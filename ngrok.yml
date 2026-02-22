@@ -1,0 +1,8 @@
+version: "2"
+authtoken: 32wywQa4hhGtd7NrU8eptt9Io3G_6ibks3s6EkDz9RSLz5NEx
+
+tunnels:
+  flareguard:
+    proto: http
+    addr: 5000
+    domain: tungstous-dara-unmachinated.ngrok-free.dev
