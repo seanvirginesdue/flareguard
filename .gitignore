@@ -30,8 +30,9 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files — keep the example template, ignore everything else
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -40,10 +41,30 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# firebase credentials
+# firebase credentials and service account keys
 *.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!vercel.json
+
+# YOLO model weights
+*.pt
+*.onnx
+*.weights
 
 # video files
 *.mp4
 *.mov
 *.avi
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+dist/
+*.egg-info/
+
+# Docker volumes / local overrides
+docker-compose.override.yml

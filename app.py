@@ -1,4 +1,4 @@
-from flask import Flask, Response
+from flask import Flask, Response, jsonify
 import cv2
 from ultralytics import YOLO
 import cvzone
@@ -9,162 +9,185 @@ from firebase_admin import credentials, firestore
 from supabase import create_client, Client
 import os
 import tempfile
-import shutil
+import json
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
-# --- Firebase + Supabase setup ---
-cred = credentials.Certificate("flareguard-97905-firebase-adminsdk-fbsvc-720e110c23.json")
-firebase_admin.initialize_app(cred)
+# ---------------------------------------------------------------------------
+# Firebase initialisation — credentials come from env, never from a file
+# ---------------------------------------------------------------------------
+def _init_firebase():
+    if firebase_admin._apps:
+        return
+    raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON env var is required")
+    cred = credentials.Certificate(json.loads(raw))
+    firebase_admin.initialize_app(cred)
+
+_init_firebase()
 db = firestore.client()
 
-SUPABASE_URL = "https://yzwqboyvxrhfslghfznp.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl6d3Fib3l2eHJoZnNsZ2hmem5wIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Nzg1NjUyNiwiZXhwIjoyMDczNDMyNTI2fQ.exrUZWtWLOYwid1Ta7PKPc0G4OjGOtk96Z_HBag3sCk"
+# ---------------------------------------------------------------------------
+# Supabase — credentials from env
+# ---------------------------------------------------------------------------
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- YOLO setup ---
-model = YOLO("best.pt")
-classnames = ['non_fire', 'severe_fire', 'small_fire', 'smoke']
+# ---------------------------------------------------------------------------
+# YOLO model — download from Supabase on first run if not cached
+# ---------------------------------------------------------------------------
+MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")
+
+def ensure_model():
+    if not os.path.exists(MODEL_PATH):
+        print("Downloading YOLO model from Supabase storage...")
+        data = supabase.storage.from_("models").download("best.pt")
+        with open(MODEL_PATH, "wb") as f:
+            f.write(data)
+        print("Model downloaded.")
+
+ensure_model()
+model = YOLO(MODEL_PATH)
+
+classnames = ["non_fire", "severe_fire", "small_fire", "smoke"]
 colors = {
-    'non_fire': (0, 255, 0),
-    'severe_fire': (0, 0, 255),
-    'small_fire': (0, 165, 255),
-    'smoke': (255, 0, 0)
+    "non_fire":    (0, 255, 0),
+    "severe_fire": (0, 0, 255),
+    "small_fire":  (0, 165, 255),
+    "smoke":       (255, 0, 0),
 }
 
-# --- Global settings ---
-camera_threads = {}
-camera_frames = {}
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+camera_threads: dict = {}
+camera_frames: dict = {}
 lock = threading.Lock()
 
 ALERT_HOLD_TIME = 0.5
-ALERT_COOLDOWN = 60
-FRAME_SKIP = 3  # Process every 3rd frame for performance
+ALERT_COOLDOWN  = 60
+FRAME_SKIP      = 3
 
 
-# -----------------------------
-#  Model auto-reload feature
-# -----------------------------
-def auto_reload_model(interval=3600):
-    def reload_task():
+# ---------------------------------------------------------------------------
+# Model auto-reload
+# ---------------------------------------------------------------------------
+def auto_reload_model(interval: int = 3600):
+    def _task():
         global model
         while True:
             time.sleep(interval)
             try:
-                with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmpfile:
-                    res = supabase.storage.from_("models").download("best.pt")
-                    tmpfile.write(res)
-                    tmpfile.flush()
-                    model = YOLO(tmpfile.name)
-                print("🔁 Reloaded updated YOLO model from Supabase")
-            except Exception as e:
-                print("Model reload failed:", e)
+                data = supabase.storage.from_("models").download("best.pt")
+                with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+                    tmp.write(data)
+                    tmp_path = tmp.name
+                model = YOLO(tmp_path)
+                os.remove(tmp_path)
+                print("YOLO model reloaded from Supabase")
+            except Exception as exc:
+                print("Model reload failed:", exc)
 
-    threading.Thread(target=reload_task, daemon=True).start()
+    threading.Thread(target=_task, daemon=True).start()
 
 
-# -----------------------------
-#  Upload functions
-# -----------------------------
-def _save_self_learning(frame, label_name, conf):
-    """Save small_fire and severe_fire detections only"""
+# ---------------------------------------------------------------------------
+# Upload helpers
+# ---------------------------------------------------------------------------
+def _save_self_learning(frame, label_name: str, conf: float):
+    if label_name not in ("small_fire", "severe_fire"):
+        return
     try:
-        if label_name not in ["small_fire", "severe_fire"]:
-            return
-
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmpfile:
-            filename = f"{label_name}_{int(time.time())}.jpg"
-            temp_path = tmpfile.name
-            cv2.imwrite(temp_path, frame)
-
-        bucket_name = "self-learning-data"
-        with open(temp_path, "rb") as f:
-            supabase.storage.from_(bucket_name).upload(
-                f"dataset/{label_name}/{filename}",
-                f,
-                {"content-type": "image/jpeg"}
+        filename = f"{label_name}_{int(conf * 100):03d}conf_{int(time.time())}.jpg"
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            cv2.imwrite(tmp.name, frame)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as f:
+            supabase.storage.from_("self-learning-data").upload(
+                f"dataset/{label_name}/{filename}", f, {"content-type": "image/jpeg"}
             )
-
-        print(f"📸 Sent {label_name} ({conf*100:.1f}%) to self-learning-data")
-        os.remove(temp_path)
-    except Exception as e:
-        print("Self-learning upload error:", e)
+        os.remove(tmp_path)
+    except Exception as exc:
+        print("Self-learning upload error:", exc)
 
 
-def upload_alert_image_async(frame, alert_type, confidence, camera_location):
-    thread = threading.Thread(
-        target=_upload_alert_image_task,
-        args=(frame, alert_type, confidence, camera_location),
-        daemon=True
-    )
-    thread.start()
-
-
-def _upload_alert_image_task(frame, alert_type, confidence, camera_location):
-    """Upload alert images asynchronously"""
+def _upload_alert_image_task(frame, alert_type: str, confidence: float, location: dict):
     try:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmpfile:
-            filename = f"{alert_type}_{int(time.time())}.jpg"
-            temp_path = tmpfile.name
-            cv2.imwrite(temp_path, frame)
-
-        bucket_name = "alert-images"
-        with open(temp_path, "rb") as f:
-            supabase.storage.from_(bucket_name).upload(filename, f, {"content-type": "image/jpeg"})
-
-        public_url = supabase.storage.from_(bucket_name).get_public_url(filename)
+        filename = f"{alert_type}_{int(time.time())}.jpg"
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            cv2.imwrite(tmp.name, frame)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as f:
+            supabase.storage.from_("alert-images").upload(filename, f, {"content-type": "image/jpeg"})
+        public_url = supabase.storage.from_("alert-images").get_public_url(filename)
         db.collection("fire_alerts").add({
-            "type": alert_type,
+            "type":       alert_type,
             "confidence": round(confidence, 2),
-            "image_url": public_url,
-            "timestamp": firestore.SERVER_TIMESTAMP,
-            "location": camera_location
+            "image_url":  public_url,
+            "timestamp":  firestore.SERVER_TIMESTAMP,
+            "location":   location,
+            "popup":      alert_type == "severe_fire",
+            "status":     "active",
         })
-        os.remove(temp_path)
-        print(f"✅ Uploaded {alert_type} alert to Supabase")
-    except Exception as e:
-        print("Upload error:", e)
+        os.remove(tmp_path)
+        print(f"Uploaded {alert_type} alert")
+    except Exception as exc:
+        print("Upload error:", exc)
 
 
-# -----------------------------
-#  Camera processing loop
-# -----------------------------
-def process_camera(camera_id, rtsp_url, latitude, longitude):
+def upload_alert_image_async(frame, alert_type: str, confidence: float, location: dict):
+    threading.Thread(
+        target=_upload_alert_image_task,
+        args=(frame.copy(), alert_type, confidence, location),
+        daemon=True,
+    ).start()
+
+
+# ---------------------------------------------------------------------------
+# Camera processing loop
+# ---------------------------------------------------------------------------
+def process_camera(camera_id: str, rtsp_url: str, latitude: str, longitude: str):
     cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
 
-    fire_detected_start = None
-    small_fire_detected_start = None
-    alert_active = False
-    small_alert_active = False
+    fire_start = small_fire_start = None
+    alert_active = small_alert_active = False
     frame_count = 0
+    location = {"latitude": latitude, "longitude": longitude}
 
-    CAMERA_LOCATION = {"latitude": latitude, "longitude": longitude}
-    print(f"🎥 Started camera stream: {camera_id}")
+    print(f"Started camera stream: {camera_id}")
 
     while True:
-        success, frame = cap.read()
-        if not success:
+        ok, frame = cap.read()
+        if not ok:
             time.sleep(2)
+            cap.release()
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
             continue
 
         frame_count += 1
         if frame_count % FRAME_SKIP != 0:
+            with lock:
+                if camera_id not in camera_frames:
+                    camera_frames[camera_id] = frame
             continue
 
-        # Resize to reduce load
         frame = cv2.resize(frame, (640, 480))
-
         results = model(frame, stream=True, imgsz=480, verbose=False)
-        severe_detected = False
-        small_fire_detected = False
-        severe_confidence = 0.0
-        small_confidence = 0.0
+
+        severe_detected = small_fire_detected = False
+        severe_conf = small_conf = 0.0
 
         for result in results:
             for box in result.boxes:
-                conf = float(box.conf[0])
-                cls = int(box.cls[0])
+                conf       = float(box.conf[0])
+                cls        = int(box.cls[0])
                 label_name = classnames[cls]
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
@@ -172,134 +195,130 @@ def process_camera(camera_id, rtsp_url, latitude, longitude):
                     cv2.rectangle(frame, (x1, y1), (x2, y2), colors[label_name], 2)
                     cvzone.putTextRect(
                         frame,
-                        f"{label_name} {conf*100:.1f}%",
-                        [x1, y1 - 10],
-                        scale=1,
-                        thickness=1,
-                        colorR=colors[label_name],
-                        offset=5
+                        f"{label_name} {conf * 100:.1f}%",
+                        [x1, max(y1 - 10, 10)],
+                        scale=1, thickness=1,
+                        colorR=colors[label_name], offset=5,
                     )
-
-                    # Save detections for self-learning bucket
-                    if label_name in ["small_fire", "severe_fire"]:
+                    if label_name in ("small_fire", "severe_fire"):
                         threading.Thread(
                             target=_save_self_learning,
                             args=(frame.copy(), label_name, conf),
-                            daemon=True
+                            daemon=True,
                         ).start()
 
                 if label_name == "severe_fire" and conf >= 0.7:
-                    severe_detected, severe_confidence = True, conf
+                    severe_detected, severe_conf = True, conf
                 if label_name == "small_fire" and conf >= 0.6:
-                    small_fire_detected, small_confidence = True, conf
+                    small_fire_detected, small_conf = True, conf
 
-        current_time = time.time()
+        now = time.time()
 
-        # --- Severe fire logic ---
-        if severe_detected and not alert_active and fire_detected_start is None:
-            fire_detected_start = current_time
-        if fire_detected_start and severe_detected and not alert_active:
-            if current_time - fire_detected_start >= ALERT_HOLD_TIME:
-                upload_alert_image_async(frame, "severe_fire", severe_confidence, CAMERA_LOCATION)
+        # Severe fire
+        if severe_detected:
+            if fire_start is None:
+                fire_start = now
+            if not alert_active and now - fire_start >= ALERT_HOLD_TIME:
+                upload_alert_image_async(frame, "severe_fire", severe_conf, location)
                 db.collection("alerts").add({
                     "type": "severe_fire",
-                    "confidence": round(severe_confidence, 2),
+                    "confidence": round(severe_conf, 2),
                     "timestamp": firestore.SERVER_TIMESTAMP,
-                    "location": CAMERA_LOCATION
+                    "location": location,
                 })
                 alert_active = True
-                print(f"🚨 Severe fire alert triggered for {camera_id}")
-        if not severe_detected:
-            fire_detected_start = None
+        else:
+            fire_start = None
             alert_active = False
 
-        # --- Small fire logic ---
-        if small_fire_detected and not small_alert_active and small_fire_detected_start is None:
-            small_fire_detected_start = current_time
-        if small_fire_detected_start and small_fire_detected and not small_alert_active:
-            if current_time - small_fire_detected_start >= ALERT_HOLD_TIME:
-                upload_alert_image_async(frame, "small_fire", small_confidence, CAMERA_LOCATION)
+        # Small fire
+        if small_fire_detected:
+            if small_fire_start is None:
+                small_fire_start = now
+            if not small_alert_active and now - small_fire_start >= ALERT_HOLD_TIME:
+                upload_alert_image_async(frame, "small_fire", small_conf, location)
                 db.collection("mobile_alerts").add({
-                    "type": "small_fire",
-                    "confidence": round(small_confidence, 2),
+                    "type":      "small_fire",
+                    "confidence": round(small_conf, 2),
                     "timestamp": firestore.SERVER_TIMESTAMP,
-                    "popup": False,
-                    "sound": False,
-                    "mobile": True,
-                    "isRead": False,
-                    "readAt": None,
-                    "location": CAMERA_LOCATION
+                    "popup":     False,
+                    "sound":     False,
+                    "mobile":    True,
+                    "isRead":    False,
+                    "readAt":    None,
+                    "location":  location,
                 })
                 small_alert_active = True
-                print(f"🔥 Small fire alert triggered for {camera_id}")
-
-                threading.Timer(ALERT_COOLDOWN, lambda: print(
-                    f"Cooldown ended — small fire alert re-enabled for {camera_id}"
-                )).start()
-
-        if not small_fire_detected:
-            small_fire_detected_start = None
+                threading.Timer(
+                    ALERT_COOLDOWN, lambda: globals().update(small_alert_active=False)
+                ).start()
+        else:
+            small_fire_start = None
 
         with lock:
             camera_frames[camera_id] = frame
 
 
-# -----------------------------
-#  Video stream endpoint
-# -----------------------------
-@app.route('/video_feed<camera_id>')
-def video_feed(camera_id):
+# ---------------------------------------------------------------------------
+# Firestore camera watcher
+# ---------------------------------------------------------------------------
+def watch_cameras():
+    def on_snapshot(col_snapshot, changes, read_time):
+        for change in changes:
+            doc_id = change.document.id
+            data   = change.document.to_dict()
+            if change.type.name == "ADDED":
+                url = data.get("url", "")
+                if url and doc_id not in camera_threads:
+                    t = threading.Thread(
+                        target=process_camera,
+                        args=(doc_id, url, data.get("latitude", ""), data.get("longitude", "")),
+                        daemon=True,
+                    )
+                    camera_threads[doc_id] = t
+                    t.start()
+                    print(f"Camera added: {doc_id}")
+            elif change.type.name == "REMOVED":
+                camera_threads.pop(doc_id, None)
+                with lock:
+                    camera_frames.pop(doc_id, None)
+                print(f"Camera removed: {doc_id}")
+
+    db.collection("cameras").on_snapshot(on_snapshot)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "cameras": len(camera_threads)}), 200
+
+
+@app.route("/video_feed/<camera_id>")
+def video_feed(camera_id: str):
+    # Basic ID validation — only alphanumeric and hyphens
+    if not camera_id.replace("-", "").isalnum():
+        return jsonify({"error": "Invalid camera ID"}), 400
+
     def generate():
         while True:
             with lock:
                 frame = camera_frames.get(camera_id)
             if frame is not None:
-                _, buffer = cv2.imencode('.jpg', frame)
-                yield (
-                    b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
-                    buffer.tobytes() + b'\r\n'
-                )
+                _, buf = cv2.imencode(".jpg", frame)
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
             else:
-                time.sleep(0.1)
+                time.sleep(0.05)
 
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-# -----------------------------
-#  Firestore camera watcher
-# -----------------------------
-def watch_cameras():
-    def on_snapshot(col_snapshot, changes, read_time):
-        for change in changes:
-            doc_id = change.document.id
-            data = change.document.to_dict()
-            if change.type.name == "ADDED":
-                url = data.get("url")
-                latitude = data.get("latitude", "")
-                longitude = data.get("longitude", "")
-                if url and doc_id not in camera_threads:
-                    thread = threading.Thread(
-                        target=process_camera,
-                        args=(doc_id, url, latitude, longitude),
-                        daemon=True
-                    )
-                    camera_threads[doc_id] = thread
-                    thread.start()
-                    print(f"Camera added: {url}")
-            elif change.type.name == "REMOVED":
-                if doc_id in camera_threads:
-                    print(f"Camera removed: {doc_id}")
-                    del camera_threads[doc_id]
-                    with lock:
-                        camera_frames.pop(doc_id, None)
-
-    db.collection("cameras").on_snapshot(on_snapshot)
+    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
-# -----------------------------
-#  Run the app
-# -----------------------------
+# ---------------------------------------------------------------------------
+# Startup — safe to call at module level (gunicorn imports this module once)
+# ---------------------------------------------------------------------------
+auto_reload_model(3600)
+watch_cameras()
+
 if __name__ == "__main__":
-    auto_reload_model(3600)
-    watch_cameras()
     app.run(host="0.0.0.0", port=5000, threaded=True)
