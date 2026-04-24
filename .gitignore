@@ -42,4 +42,8 @@ next-env.d.ts
 
 # firebase credentials
 *.json
-!flareguard-97905-firebase-adminsdk-fbsvc-720e110c23.json
+
+# video files
+*.mp4
+*.mov
+*.avi
