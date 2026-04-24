@@ -16,6 +16,7 @@ interface UserData {
 export default function Users() {
   const [users, setUsers] = useState<UserData[]>([]);
   const [search, setSearch] = useState("");
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchUsers = async () => {
@@ -34,8 +35,9 @@ export default function Users() {
           };
         });
         setUsers(usersData);
-      } catch (error) {
-        console.error("Error fetching users:", error);
+      } catch (err) {
+        console.error("Error fetching users:", err);
+        setError("Failed to load users. Please refresh.");
       }
     };
 
@@ -65,6 +67,12 @@ export default function Users() {
           <span>{users.length} user{users.length === 1 ? "" : "s"} total</span>
         </div>
       </div>
+
+      {error && (
+        <div role="alert" className="mb-4 px-4 py-3 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm">
+          {error}
+        </div>
+      )}
 
       <div className="mb-6 flex items-center">
         <div className="relative w-full">

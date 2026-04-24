@@ -1,16 +1,24 @@
 import { NextResponse } from "next/server";
 
 export async function POST(req: Request) {
-  const { token } = await req.json();
+  try {
+    const { token } = await req.json();
 
-  const res = NextResponse.json({ success: true });
+    if (!token || typeof token !== "string") {
+      return NextResponse.json({ error: "Missing token" }, { status: 400 });
+    }
 
-  res.cookies.set("authToken", token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "strict",
-    path: "/",
-  });
+    const res = NextResponse.json({ success: true });
+    res.cookies.set("authToken", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+      path: "/",
+      maxAge: 60 * 60, // 1 hour
+    });
 
-  return res;
+    return res;
+  } catch {
+    return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+  }
 }

@@ -2,38 +2,56 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { signInWithEmailAndPassword } from "firebase/auth";
+import { signInWithEmailAndPassword, AuthError } from "firebase/auth";
 import { auth } from "@/lib/firebaseConfig";
+
+function friendlyAuthError(code: string): string {
+  switch (code) {
+    case "auth/user-not-found":
+    case "auth/wrong-password":
+    case "auth/invalid-credential":
+      return "Invalid email or password.";
+    case "auth/too-many-requests":
+      return "Too many failed attempts. Try again later.";
+    case "auth/network-request-failed":
+      return "Network error. Check your connection.";
+    default:
+      return "Login failed. Please try again.";
+  }
+}
 
 export default function AdminLogin() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError(null);
     setLoading(true);
 
     try {
-      const userCredential = await signInWithEmailAndPassword(
-        auth,
-        email,
-        password
-      );
-      const user = userCredential.user;
-      const token = await user.getIdToken(true);
+      const userCredential = await signInWithEmailAndPassword(auth, email, password);
+      const token = await userCredential.user.getIdToken(true);
 
-      await fetch("/api/set-token", {
+      const res = await fetch("/api/set-token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token }),
       });
 
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setError(data.error === "Not authorized" ? "This account does not have admin access." : "Login failed.");
+        return;
+      }
+
       router.push("/admin-dashboard");
-    } catch (error: any) {
-      console.error(error);
-      alert("Login failed: " + error.message);
+    } catch (err: unknown) {
+      const code = (err as AuthError)?.code ?? "";
+      setError(friendlyAuthError(code));
     } finally {
       setLoading(false);
     }
@@ -41,7 +59,7 @@ export default function AdminLogin() {
 
   return (
     <div className="min-h-screen flex flex-col md:flex-row bg-gradient-to-br from-slate-900 via-slate-950 to-slate-900">
-      {/* Branding / Hero side */}
+      {/* Branding side */}
       <div className="hidden md:flex flex-1 items-center justify-center p-12 relative overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-br from-red-700 via-red-600 to-orange-400 opacity-90" />
         <div className="absolute -top-32 -right-32 h-72 w-72 rounded-full bg-white/10 blur-3xl" />
@@ -75,7 +93,7 @@ export default function AdminLogin() {
         </div>
       </div>
 
-      {/* Login card side */}
+      {/* Login card */}
       <div className="flex flex-1 items-center justify-center px-6 py-10 md:py-12">
         <div className="w-full max-w-md bg-white/95 backdrop-blur-sm p-8 rounded-2xl shadow-2xl border border-slate-200">
           <div className="mb-6 text-center md:text-left">
@@ -90,28 +108,41 @@ export default function AdminLogin() {
             </p>
           </div>
 
+          {error && (
+            <div
+              role="alert"
+              className="mb-4 px-4 py-3 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm"
+            >
+              {error}
+            </div>
+          )}
+
           <form onSubmit={handleLogin} className="space-y-5">
             <div className="space-y-1.5">
-              <label className="block text-gray-700 text-sm font-medium">
+              <label htmlFor="email" className="block text-gray-700 text-sm font-medium">
                 Email address
               </label>
               <input
+                id="email"
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
+                autoComplete="email"
                 className="text-black w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent transition text-sm md:text-[15px] bg-white"
               />
             </div>
             <div className="space-y-1.5">
-              <label className="block text-gray-700 text-sm font-medium">
+              <label htmlFor="password" className="block text-gray-700 text-sm font-medium">
                 Password
               </label>
               <input
+                id="password"
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
+                autoComplete="current-password"
                 className="text-black w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent transition text-sm md:text-[15px] bg-white"
               />
             </div>
@@ -135,4 +166,3 @@ export default function AdminLogin() {
     </div>
   );
 }
- 

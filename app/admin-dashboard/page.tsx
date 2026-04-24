@@ -44,15 +44,20 @@ function DashboardStats() {
 
   useEffect(() => {
     const fetchData = async () => {
-      const usersSnap = await getDocs(collection(db, "users"));
-      const alertsSnap = await getDocs(collection(db, "alerts"));
-      const logsSnap = await getDocs(collection(db, "logs"));
-
-      setStats({
-        users: usersSnap.size,
-        alerts: alertsSnap.size,
-        logs: logsSnap.size,
-      });
+      try {
+        const [usersSnap, alertsSnap, logsSnap] = await Promise.all([
+          getDocs(collection(db, "users")),
+          getDocs(collection(db, "alerts")),
+          getDocs(collection(db, "logs")),
+        ]);
+        setStats({
+          users: usersSnap.size,
+          alerts: alertsSnap.size,
+          logs: logsSnap.size,
+        });
+      } catch (err) {
+        console.error("Failed to load dashboard stats:", err);
+      }
     };
     fetchData();
   }, []);
@@ -96,9 +101,20 @@ function DashboardStats() {
   );
 }
 
+interface AlertSummary {
+  type?: string;
+  confidence?: number;
+  timestamp?: number;
+}
+
+interface LogSummary {
+  type?: string;
+  timestamp?: number;
+}
+
 function RecentAlertsLogs() {
-  const [alerts, setAlerts] = useState<any[]>([]);
-  const [logs, setLogs] = useState<any[]>([]);
+  const [alerts, setAlerts] = useState<AlertSummary[]>([]);
+  const [logs, setLogs] = useState<LogSummary[]>([]);
 
   useEffect(() => {
     const fetchRecent = async () => {
@@ -132,7 +148,7 @@ function RecentAlertsLogs() {
               <span className="font-semibold text-red-700">{a.type}</span> –{" "}
               <span>{Math.round(a.confidence * 100)}%</span>
               <div className="text-gray-500 text-xs mt-1">
-                {new Date(a.timestamp * 1000).toLocaleString()}
+                {a.timestamp ? new Date(a.timestamp * 1000).toLocaleString() : "No timestamp"}
               </div>
             </li>
           ))}
@@ -152,7 +168,7 @@ function RecentAlertsLogs() {
             >
               <span className="font-semibold text-gray-800">{l.type}</span>
               <div className="text-gray-500 text-xs mt-1">
-                {new Date(l.timestamp * 1000).toLocaleString()}
+                {l.timestamp ? new Date(l.timestamp * 1000).toLocaleString() : "No timestamp"}
               </div>
             </li>
           ))}
@@ -162,8 +178,13 @@ function RecentAlertsLogs() {
   );
 }
 
+interface ChartPoint {
+  date: string;
+  alerts: number;
+}
+
 function AlertsChart() {
-  const [data, setData] = useState<any[]>([]);
+  const [data, setData] = useState<ChartPoint[]>([]);
 
   useEffect(() => {
     const fetchAlerts = async () => {

@@ -117,16 +117,13 @@ export default function LogsAndReports() {
   }, []);
 
   const playNotificationSound = () => {
-  const audio = new Audio("/alert.mp3");
-  audio.loop = true; // repeat if shorter than 5 seconds
-  audio.play().catch(() => {});
-
-  // Stop after 5 seconds
-  setTimeout(() => {
-    audio.pause();
-    audio.currentTime = 0;
-  }, 5000);
-};
+    const audio = new Audio("/alert.mp3");
+    audio.play().catch(() => {});
+    setTimeout(() => {
+      audio.pause();
+      audio.src = "";
+    }, 5000);
+  };
 
 
   const showNewReportNotification = (report: Report) => {
@@ -235,7 +232,12 @@ export default function LogsAndReports() {
   };
 
   const openDirections = (lat: number, lng: number) => {
-    window.open(`https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`, "_blank");
+    if (!isFinite(lat) || !isFinite(lng)) return;
+    window.open(
+      `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`,
+      "_blank",
+      "noopener,noreferrer"
+    );
   };
 
   const archiveReport = async (report: Report) => {
